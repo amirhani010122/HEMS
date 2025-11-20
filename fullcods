@@ -1,0 +1,3802 @@
+:~/hemsv2$ tree app/
+app/
+├── auth.py
+├── config.py
+├── database.py
+├── main.py
+├── models.py
+├── __pycache__
+│   ├── auth.cpython-311.pyc
+│   ├── auth.cpython-38.pyc
+│   ├── config.cpython-311.pyc
+│   ├── config.cpython-38.pyc
+│   ├── database.cpython-311.pyc
+│   ├── database.cpython-38.pyc
+│   ├── main.cpython-311.pyc
+│   ├── main.cpython-38.pyc
+│   ├── models.cpython-311.pyc
+│   ├── models.cpython-38.pyc
+│   ├── utils.cpython-311.pyc
+│   └── utils.cpython-38.pyc
+├── routers
+│   ├── alerts.py
+│   ├── auth.py
+│   ├── consumptions.py
+│   ├── devices.py
+│   ├── predictions.py
+│   ├── __pycache__
+│   │   ├── alerts.cpython-311.pyc
+│   │   ├── alerts.cpython-38.pyc
+│   │   ├── auth.cpython-311.pyc
+│   │   ├── auth.cpython-38.pyc
+│   │   ├── consumptions.cpython-311.pyc
+│   │   ├── consumptions.cpython-38.pyc
+│   │   ├── devices.cpython-311.pyc
+│   │   ├── devices.cpython-38.pyc
+│   │   ├── predictions.cpython-311.pyc
+│   │   ├── predictions.cpython-38.pyc
+│   │   ├── subscriptions.cpython-311.pyc
+│   │   ├── subscriptions.cpython-38.pyc
+│   │   ├── users.cpython-311.pyc
+│   │   └── users.cpython-38.pyc
+│   ├── subscriptions.py
+│   └── users.py
+├── services
+│   ├── ai_service.py
+│   ├── alert_service.py
+│   ├── consumption_service.py
+│   ├── device_service.py
+│   ├── __pycache__
+│   │   ├── ai_service.cpython-311.pyc
+│   │   ├── ai_service.cpython-38.pyc
+│   │   ├── alert_service.cpython-311.pyc
+│   │   ├── alert_service.cpython-38.pyc
+│   │   ├── consumption_service.cpython-311.pyc
+│   │   ├── consumption_service.cpython-38.pyc
+│   │   ├── save_mode_service.cpython-311.pyc
+│   │   ├── save_mode_service.cpython-38.pyc
+│   │   ├── subscription_service.cpython-311.pyc
+│   │   └── subscription_service.cpython-38.pyc
+│   ├── save_mode_service.py
+│   └── subscription_service.py
+└── utils.py
+
+
+
+
+==================== app/routers/consumptions.py ====================
+from typing import List
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.database import get_collection
+from app.auth import get_current_active_user
+from app.models import User, Consumption, SensorData, ConsumptionAggregation, PyObjectId
+from app.utils import watt_to_kwh
+from app.services.consumption_service import ConsumptionService
+from app.services.subscription_service import SubscriptionService
+from app.services.alert_service import AlertService
+from app.services.save_mode_service import SaveModeService
+from app.services.ai_service import AIService
+import logging
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+@router.post("/sensor/data")
+async def receive_sensor_data(sensor_data: SensorData):
+    """استقبال بيانات الاستهلاك من العداد باستخدام meter_id فقط"""
+    try:
+        # البحث عن المستخدم باستخدام meter_id فقط
+        users_collection = get_collection("users")
+        user_data = await users_collection.find_one({"meter_id": sensor_data.meter_id})
+
+        if not user_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Meter ID not registered"
+            )
+
+        user = User(**user_data)
+
+        # Convert watt to kWh (assuming 1 hour measurement)
+        power_usage_kwh = watt_to_kwh(sensor_data.total_power_watt)
+
+        # Create consumption record
+        consumption = Consumption(
+            user_id=user.id,
+            device_id=sensor_data.device_id,
+            power_usage_kwh=power_usage_kwh,
+            total_power_watt=sensor_data.total_power_watt,
+            timestamp=sensor_data.timestamp or datetime.utcnow(),
+            temperature=sensor_data.temperature,
+            devices_on=sensor_data.devices_on,
+            devices_off=sensor_data.devices_off,  # ⬅️ تم الإضافة
+            location=sensor_data.location,
+        )
+
+        # Store consumption
+        await ConsumptionService.create_consumption(consumption)
+
+        # Deduct from subscription
+        deduction_success = await SubscriptionService.deduct_energy(
+            user.id, power_usage_kwh
+        )
+
+        if not deduction_success:
+            logger.warning(f"Failed to deduct energy for user {user.id}")
+
+        # Check subscription percentage and trigger alerts
+        percentage = await SubscriptionService.get_subscription_percentage(user.id)
+        if percentage is not None:
+            # Check and create alerts
+            triggered_alerts = await AlertService.check_and_create_alerts(
+                user.id, percentage
+            )
+
+            # Auto-enable save mode if critical threshold reached
+            if "CRITICAL" in triggered_alerts:
+                await SaveModeService.process_low_energy_save_mode(user.id, percentage)
+
+        # Trigger AI prediction (async - don't wait for response)
+        import asyncio
+
+        asyncio.create_task(AIService.fetch_ai_prediction(user.id))
+
+        return {
+            "status": "success",
+            "message": "Sensor data processed successfully",
+            "kwh_used": power_usage_kwh,
+            "user_id": str(user.id),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing sensor data: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error processing sensor data",
+        )
+
+
+@router.get("/user/{user_id}/hourly", response_model=List[ConsumptionAggregation])
+async def get_hourly_consumption(
+    user_id: str, date: datetime, current_user: User = Depends(get_current_active_user)
+):
+    """Get hourly consumption for a specific date"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    return await ConsumptionService.get_hourly_consumption(PyObjectId(user_id), date)
+
+
+@router.get("/user/{user_id}/daily", response_model=List[ConsumptionAggregation])
+async def get_daily_consumption(
+    user_id: str,
+    year: int,
+    month: int,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Get daily consumption for a specific month"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    return await ConsumptionService.get_daily_consumption(
+        PyObjectId(user_id), year, month
+    )
+
+
+@router.get("/user/{user_id}/monthly", response_model=List[ConsumptionAggregation])
+async def get_monthly_consumption(
+    user_id: str, year: int, current_user: User = Depends(get_current_active_user)
+):
+    """Get monthly consumption for a specific year"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    return await ConsumptionService.get_monthly_consumption(PyObjectId(user_id), year)
+
+
+@router.get("/user/{user_id}/today")
+async def get_today_consumption(
+    user_id: str, current_user: User = Depends(get_current_active_user)
+):
+    """Get today's total consumption"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    total_consumption = await ConsumptionService.get_total_consumption_today(
+        PyObjectId(user_id)
+    )
+    return {"total_consumption_kwh": total_consumption}
+
+
+
+==================== app/routers/subscriptions.py ====================
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.auth import get_current_active_user
+from app.models import User, Subscription, PlanResponse, UpgradePlanRequest
+from app.services.subscription_service import SubscriptionService
+from app.database import get_collection
+
+router = APIRouter()
+
+
+@router.get("/plans", response_model=List[PlanResponse])
+async def get_available_plans():
+    """Get available subscription plans"""
+    return SubscriptionService.get_available_plans()  # ⬅️ بدون await
+
+
+@router.get("/my-subscriptions", response_model=List[Subscription])
+async def get_my_subscriptions(current_user: User = Depends(get_current_active_user)):
+    """Get current user's subscriptions"""
+    return await SubscriptionService.get_user_subscriptions(current_user.id)
+
+
+@router.get("/active")
+async def get_active_subscription(
+    current_user: User = Depends(get_current_active_user),
+):
+    """Get user's active subscription"""
+    subscription = await SubscriptionService.get_active_subscription(current_user.id)
+
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No active subscription found"
+        )
+
+    return subscription
+
+
+@router.post("/upgrade")
+async def upgrade_plan(
+    upgrade_request: UpgradePlanRequest,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Upgrade user's subscription plan"""
+    # التحقق من صحة الباقة المختارة
+    available_plans = SubscriptionService.get_available_plans()  # ⬅️ بدون await
+    if upgrade_request.plan_id not in [plan.id for plan in available_plans]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan ID"
+        )
+
+    # ترقية الباقة
+    success = await SubscriptionService.upgrade_plan(
+        user_id=current_user.id, new_plan_id=upgrade_request.plan_id
+    )
+
+    if success:
+        # تحديث الباقة المختارة في بيانات المستخدم
+        users_collection = get_collection("users")
+        await users_collection.update_one(
+            {"_id": current_user.id},
+            {"$set": {"selected_plan": upgrade_request.plan_id}},
+        )
+
+        return {
+            "status": "success",
+            "message": f"Plan upgraded to {upgrade_request.plan_id}",
+            "new_plan": upgrade_request.plan_id,
+        }
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to upgrade plan",
+        )
+
+
+@router.get("/my-plan")
+async def get_my_plan(current_user: User = Depends(get_current_active_user)):
+    """Get current user's active plan details"""
+    active_subscription = await SubscriptionService.get_active_subscription(
+        current_user.id
+    )
+    if not active_subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No active subscription found"
+        )
+
+    # الحصول على تفاصيل الباقة
+    available_plans = SubscriptionService.get_available_plans()  # ⬅️ بدون await
+    plan_details = next(
+        (plan for plan in available_plans if plan.id == active_subscription.plan_id),
+        None,
+    )
+
+    if not plan_details:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Plan details not found"
+        )
+
+    return {"subscription": active_subscription, "plan_details": plan_details}
+
+
+
+==================== app/routers/users.py ====================
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.database import get_collection
+from app.auth import get_current_active_user
+from app.models import User, UserResponse, UserCreate, PyObjectId
+from app.utils import get_password_hash
+from app.services.subscription_service import SubscriptionService
+
+router = APIRouter()
+
+
+@router.post("/register", response_model=UserResponse)
+async def register_user(user_data: UserCreate):
+    """Register a new user"""
+    users_collection = get_collection("users")
+
+    # Check if user already exists
+    existing_user = await users_collection.find_one({"email": user_data.email})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User with this email already exists",
+        )
+
+    # Check if meter_id already exists
+    existing_meter = await users_collection.find_one({"meter_id": user_data.meter_id})
+    if existing_meter:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Meter ID already registered",
+        )
+
+    # ⬅️ تم الإضافة: التحقق من صحة الباقة المختارة
+    available_plans = await SubscriptionService.get_available_plans()
+    if user_data.selected_plan not in [plan.id for plan in available_plans]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan selected"
+        )
+
+    # Create user
+    user = User(
+        name=user_data.name,
+        email=user_data.email,
+        hashed_password=get_password_hash(user_data.password),
+        building_type=user_data.building_type,
+        preferred_temp=user_data.preferred_temp,
+        energy_goal=user_data.energy_goal,
+        meter_id=user_data.meter_id,
+        selected_plan=user_data.selected_plan,  # ⬅️ تم الإضافة
+    )
+
+    result = await users_collection.insert_one(user.dict(by_alias=True))
+
+    # ⬅️ تم التعديل: إنشاء الباقة بناءً على الخطة المختارة
+    subscription_success = await SubscriptionService.create_subscription_from_plan(
+        user_id=result.inserted_id, plan_id=user_data.selected_plan
+    )
+
+    if not subscription_success:
+        # If subscription creation fails, delete the user
+        await users_collection.delete_one({"_id": result.inserted_id})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create subscription",
+        )
+
+    return UserResponse(
+        id=str(result.inserted_id),
+        name=user.name,
+        email=user.email,
+        building_type=user.building_type,
+        preferred_temp=user.preferred_temp,
+        energy_goal=user.energy_goal,
+        save_mode=user.save_mode,
+        meter_id=user.meter_id,
+        selected_plan=user.selected_plan,  # ⬅️ تم الإضافة
+    )
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user(current_user: User = Depends(get_current_active_user)):
+    """Get current user information"""
+    return UserResponse(
+        id=str(current_user.id),
+        name=current_user.name,
+        email=current_user.email,
+        building_type=current_user.building_type,
+        preferred_temp=current_user.preferred_temp,
+        energy_goal=current_user.energy_goal,
+        save_mode=current_user.save_mode,
+        meter_id=current_user.meter_id,
+        selected_plan=current_user.selected_plan,  # ⬅️ تم الإضافة
+    )
+
+
+@router.get("/{user_id}/subscription/percentage")
+async def get_subscription_percentage(
+    user_id: str, current_user: User = Depends(get_current_active_user)
+):
+    """Get user's subscription percentage"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    percentage = await SubscriptionService.get_subscription_percentage(
+        PyObjectId(user_id)
+    )
+    if percentage is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No active subscription found"
+        )
+
+    return {"percentage": percentage}
+
+
+
+==================== app/routers/predictions.py ====================
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.auth import get_current_active_user
+from app.models import User, Prediction
+from app.services.ai_service import AIService
+
+router = APIRouter()
+
+@router.get("/my-predictions", response_model=List[Prediction])
+async def get_my_predictions(current_user: User = Depends(get_current_active_user)):
+    """Get user's prediction history"""
+    return await AIService.get_user_predictions(current_user.id)
+
+@router.post("/refresh")
+async def refresh_prediction(current_user: User = Depends(get_current_active_user)):
+    """Trigger a new prediction from AI service"""
+    prediction = await AIService.fetch_ai_prediction(current_user.id)
+    
+    if prediction:
+        return {
+            "status": "success", 
+            "message": "Prediction generated",
+            "prediction_id": str(prediction.id)
+        }
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate prediction"
+        )
+
+
+==================== app/routers/devices.py ====================
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.auth import get_current_active_user
+from app.models import User, SaveModeRequest
+from app.services.save_mode_service import SaveModeService
+
+router = APIRouter()
+
+
+# -----------------------------
+# Save Mode endpoints only
+# -----------------------------
+@router.post("/save_mode")
+async def toggle_save_mode(
+    request: SaveModeRequest, current_user: User = Depends(get_current_active_user)
+):
+    success = await SaveModeService.enable_save_mode(current_user.id, request.reason)
+    if success:
+        return {"status": "success", "message": f"Save mode enabled: {request.reason}"}
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to enable save mode",
+        )
+
+
+@router.delete("/save_mode")
+async def disable_save_mode(current_user: User = Depends(get_current_active_user)):
+    success = await SaveModeService.disable_save_mode(current_user.id)
+    if success:
+        return {"status": "success", "message": "Save mode disabled"}
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to disable save mode",
+        )
+
+
+@router.get("/save_mode/status")
+async def get_save_mode_status(current_user: User = Depends(get_current_active_user)):
+    status_info = await SaveModeService.get_save_mode_status(current_user.id)
+    return status_info
+
+
+@router.get("/get_commands")
+async def get_device_commands(current_user: User = Depends(get_current_active_user)):
+    status_info = await SaveModeService.get_save_mode_status(current_user.id)
+    if status_info["save_mode"]:
+        return {
+            "commands": [status_info["command"]],
+            "timestamp": status_info.get("activated_at"),
+        }
+    else:
+        return {"commands": []}
+
+
+
+==================== app/routers/auth.py ====================
+from datetime import timedelta
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from app.database import get_collection
+from app.models import Token, UserCreate
+from app.utils import verify_password, create_access_token
+from app.config import settings
+
+router = APIRouter()
+
+@router.post("/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """User login"""
+    users_collection = get_collection("users")
+    user = await users_collection.find_one({"email": form_data.username})
+    
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["email"]}, expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+==================== app/routers/alerts.py ====================
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.auth import get_current_active_user
+from app.models import User, Alert, PyObjectId
+from app.services.alert_service import AlertService
+
+router = APIRouter()
+
+@router.get("/list", response_model=List[Alert])
+async def get_alerts(
+    read: Optional[bool] = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get user alerts with optional filters"""
+    return await AlertService.get_user_alerts(current_user.id, read, limit)
+
+@router.get("/latest")
+async def get_latest_alerts(current_user: User = Depends(get_current_active_user)):
+    """Get latest unread alerts"""
+    alerts = await AlertService.get_user_alerts(current_user.id, read=False, limit=10)
+    unread_count = await AlertService.get_unread_count(current_user.id)
+    
+    return {
+        "alerts": alerts,
+        "unread_count": unread_count
+    }
+
+@router.post("/mark-as-read/{alert_id}")
+async def mark_alert_as_read(
+    alert_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Mark a specific alert as read"""
+    success = await AlertService.mark_alert_as_read(PyObjectId(alert_id), current_user.id)
+    
+    if success:
+        return {"status": "success", "message": "Alert marked as read"}
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Alert not found"
+        )
+
+@router.post("/mark-all-read")
+async def mark_all_alerts_as_read(current_user: User = Depends(get_current_active_user)):
+    """Mark all user alerts as read"""
+    success = await AlertService.mark_all_alerts_as_read(current_user.id)
+    
+    if success:
+        return {"status": "success", "message": "All alerts marked as read"}
+    else:
+        return {"status": "success", "message": "No unread alerts"}
+
+
+==================== app/database.py ====================
+from motor.motor_asyncio import AsyncIOMotorClient
+from app.config import settings
+
+class Database:
+    client: AsyncIOMotorClient = None # type: ignore
+    database = None
+
+db = Database()
+
+async def connect_to_mongo():
+    db.client = AsyncIOMotorClient(settings.MONGODB_URL)
+    db.database = db.client[settings.MONGODB_DB_NAME]
+    print("Connected to MongoDB")
+
+async def close_mongo_connection():
+    if db.client:
+        db.client.close()
+        print("Disconnected from MongoDB")
+
+def get_database():
+    return db.database
+
+def get_collection(collection_name: str):
+    return db.database[collection_name]
+
+
+==================== app/config.py ====================
+import os
+from typing import Optional
+from pydantic import BaseSettings
+
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "HEMS Backend"
+    VERSION: str = "1.0.0"
+    API_V1_STR: str = "/api/v1"
+
+    # MongoDB
+    MONGODB_URL: str = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    MONGODB_DB_NAME: str = os.getenv("MONGODB_DB_NAME", "HEMS")
+
+    # JWT
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+
+    # External AI Service
+    AI_SERVICE_URL: str = os.getenv("AI_SERVICE_URL", "http://localhost:8001")
+    AI_SERVICE_TIMEOUT: int = 30
+
+    # Alert Thresholds
+    WARNING_THRESHOLD: float = 0.2  # 20%
+    CRITICAL_THRESHOLD: float = 0.1  # 10%
+    FINAL_THRESHOLD: float = 0.05  # 5%
+
+    class Config:
+        case_sensitive = True
+
+
+settings = Settings()
+
+
+
+==================== app/auth.py ====================
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from app.database import get_collection
+from app.utils import verify_token
+from app.models import User
+
+security = HTTPBearer()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    payload = verify_token(credentials.credentials)
+    if payload is None:
+        raise credentials_exception
+        
+    email = payload.get("sub")
+    if email is None:
+        raise credentials_exception
+    
+    users_collection = get_collection("users")
+    user_data = await users_collection.find_one({"email": email})
+    if user_data is None:
+        raise credentials_exception
+        
+    return User(**user_data)
+
+async def get_current_active_user(current_user: User = Depends(get_current_user)):
+    return current_user
+
+
+==================== app/models.py ====================
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from pydantic import BaseModel, Field, EmailStr, validator
+from bson import ObjectId
+import json
+
+
+class PyObjectId(ObjectId):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid objectid")
+        return ObjectId(v)
+
+    @classmethod
+    def __modify_schema__(cls, field_schema):
+        field_schema.update(type="string")
+
+
+# ⬇️⬇️⬇️ النماذج الجديدة للباقات ⬇️⬇️⬇️
+class Plan(BaseModel):
+    id: str  # basic, standard, premium
+    name: str
+    total_kwh: float
+    price: float
+    duration_days: int
+    features: List[str]
+
+
+class PlanResponse(BaseModel):
+    id: str
+    name: str
+    total_kwh: float
+    price: float
+    duration_days: int
+    features: List[str]
+
+
+class User(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    name: str = Field(..., min_length=1, max_length=100)
+    email: EmailStr
+    hashed_password: str
+    building_type: str
+    preferred_temp: float = Field(24.0, ge=15.0, le=30.0)
+    energy_goal: Optional[str] = None
+    save_mode: bool = False
+    save_mode_reason: Optional[str] = None
+    meter_id: str = Field(...)
+    selected_plan: str = Field(default="basic")  # ⬅️ الجديد
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    building_type: str
+    preferred_temp: float = 24.0
+    energy_goal: Optional[str] = None
+    meter_id: str = Field(...)
+    selected_plan: str = Field(default="basic")  # ⬅️ الجديد
+
+
+class UserResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+    building_type: str
+    preferred_temp: float
+    energy_goal: Optional[str]
+    save_mode: bool
+    meter_id: str
+    selected_plan: str  # ⬅️ الجديد
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
+
+class Subscription(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    plan_id: str  # ⬅️ تحديث: نستخدم plan_id بدل plan_name
+    plan_name: str
+    total_kwh: float = Field(..., gt=0)
+    remaining_kwh: float = Field(..., ge=0)
+    price: float = Field(..., ge=0)  # ⬅️ تحديث: سعر الباقة
+    start_date: datetime
+    end_date: datetime
+    status: str
+
+    @validator("status")
+    def validate_status(cls, v):
+        if v not in ["active", "expired", "cancelled"]:
+            raise ValueError("Status must be active, expired, or cancelled")
+        return v
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class Consumption(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    device_id: str
+    power_usage_kwh: float = Field(..., ge=0)
+    total_power_watt: float = Field(..., ge=0)
+    timestamp: datetime
+    temperature: Optional[float] = None
+    devices_on: int = Field(..., ge=0)
+    devices_off: int = Field(..., ge=0)
+    location: str
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class Prediction(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    prediction_type: str
+    suggestions: List[str]
+    timestamp: datetime
+    source: str = "external_ai_service"
+
+    @validator("prediction_type")
+    def validate_prediction_type(cls, v):
+        if v not in ["daily", "weekly", "monthly"]:
+            raise ValueError("Prediction type must be daily, weekly, or monthly")
+        return v
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class Alert(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    alert_type: str
+    percentage: float = Field(..., ge=0, le=100)
+    message: str
+    timestamp: datetime
+    read: bool = False
+    auto_triggered: bool = True
+
+    @validator("alert_type")
+    def validate_alert_type(cls, v):
+        if v not in ["WARNING", "CRITICAL", "FINAL"]:
+            raise ValueError("Alert type must be WARNING, CRITICAL, or FINAL")
+        return v
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class SensorData(BaseModel):
+    device_id: str
+    meter_id: str
+    total_power_watt: float = Field(..., ge=0)
+    timestamp: Optional[datetime] = None
+    temperature: Optional[float] = None
+    devices_on: int = Field(..., ge=0)
+    devices_off: int = Field(..., ge=0)
+    location: str
+
+
+class SaveModeCommand(BaseModel):
+    action: str = "save_mode"
+    devices_to_turn_off: List[str] = ["AC", "Heater", "WaterBoiler"]
+    priority: str = "high"
+
+
+class SaveModeRequest(BaseModel):
+    reason: str
+
+    @validator("reason")
+    def validate_reason(cls, v):
+        if v not in ["manual", "auto_low_package"]:
+            raise ValueError("Reason must be manual or auto_low_package")
+        return v
+
+
+class ConsumptionAggregation(BaseModel):
+    period: str
+    total_consumption_kwh: float
+    average_power_watt: float
+    timestamp: datetime
+
+
+# ⬇️⬇️⬇️ نموذج لترقية الباقة ⬇️⬇️⬇️
+class UpgradePlanRequest(BaseModel):
+    plan_id: str
+
+    @validator("plan_id")
+    def validate_plan_id(cls, v):
+        if v not in ["basic", "standard", "premium"]:
+            raise ValueError("Plan ID must be basic, standard, or premium")
+        return v
+
+
+
+==================== app/main.py ====================
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.database import connect_to_mongo, close_mongo_connection
+from app.routers import (
+    users, auth, consumptions, devices, 
+    subscriptions, alerts, predictions
+)
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+)
+
+origins = ["*"]
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(auth.router, prefix=f"{settings.API_V1_STR}/auth", tags=["auth"])
+app.include_router(users.router, prefix=f"{settings.API_V1_STR}/users", tags=["users"])
+app.include_router(consumptions.router, prefix=f"{settings.API_V1_STR}/consumptions", tags=["consumptions"])
+app.include_router(devices.router, prefix=f"{settings.API_V1_STR}/devices", tags=["devices"])
+app.include_router(subscriptions.router, prefix=f"{settings.API_V1_STR}/subscriptions", tags=["subscriptions"])
+app.include_router(alerts.router, prefix=f"{settings.API_V1_STR}/alerts", tags=["alerts"])
+app.include_router(predictions.router, prefix=f"{settings.API_V1_STR}/predictions", tags=["predictions"])
+
+
+
+@app.on_event("startup")
+async def startup_event():
+    await connect_to_mongo()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_mongo_connection()
+
+@app.get("/")
+async def root():
+    return {
+        "message": "HEMS Backend API",
+        "version": settings.VERSION,
+        "docs": "/docs"
+    }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": "2024-01-01T00:00:00Z"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="192.168.10.129",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
+
+
+==================== app/services/device_service.py ====================
+import secrets
+from typing import List, Optional
+from datetime import datetime
+from app.database import get_collection
+from app.models import Device, PyObjectId
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class DeviceService:
+    @staticmethod
+    def generate_api_key() -> str:
+        """توليد مفتاح API عشوائي وآمن"""
+        return f"HEMS_{secrets.token_urlsafe(24)}"
+
+    @staticmethod
+    async def create_device(device: Device) -> bool:
+        """تسجيل جهاز جديد في النظام"""
+        devices_collection = get_collection("devices")
+
+        # التحقق من أن device_id غير مستخدم لنفس المستخدم
+        existing_device = await devices_collection.find_one(
+            {"device_id": device.device_id, "user_id": device.user_id}
+        )
+
+        if existing_device:
+            return False
+
+        result = await devices_collection.insert_one(device.dict(by_alias=True))
+        return result.acknowledged
+
+    @staticmethod
+    async def get_device_by_api_key(api_key: str) -> Optional[Device]:
+        """الحصول على بيانات الجهاز باستخدام API Key"""
+        devices_collection = get_collection("devices")
+        device_data = await devices_collection.find_one(
+            {"api_key": api_key, "is_active": True}
+        )
+
+        if device_data:
+            return Device(**device_data)
+        return None
+
+    @staticmethod
+    async def get_user_devices(user_id: PyObjectId) -> List[Device]:
+        """الحصول على جميع أجهزة المستخدم"""
+        devices_collection = get_collection("devices")
+        cursor = devices_collection.find({"user_id": user_id})
+
+        devices = []
+        async for doc in cursor:
+            devices.append(Device(**doc))
+        return devices
+
+    @staticmethod
+    async def deactivate_device(device_id: str, user_id: PyObjectId) -> bool:
+        """إبطال جهاز (حذف منطقي)"""
+        devices_collection = get_collection("devices")
+        result = await devices_collection.update_one(
+            {"device_id": device_id, "user_id": user_id}, {"$set": {"is_active": False}}
+        )
+        return result.modified_count > 0
+
+
+
+==================== app/services/ai_service.py ====================
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta
+import httpx
+from app.database import get_collection
+from app.models import Prediction, PyObjectId, Consumption
+from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+class AIService:
+    @staticmethod
+    async def get_user_consumption_data(user_id: PyObjectId, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get user consumption data for AI analysis"""
+        consumptions_collection = get_collection("consumptions")
+        
+        start_time = datetime.utcnow() - timedelta(hours=hours)
+        
+        cursor = consumptions_collection.find({
+            "user_id": user_id,
+            "timestamp": {"$gte": start_time}
+        }).sort("timestamp", 1)
+        
+        data = []
+        async for doc in cursor:
+            consumption = Consumption(**doc)
+            data.append({
+                "timestamp": consumption.timestamp.isoformat(),
+                "power_usage_kwh": consumption.power_usage_kwh,
+                "total_power_watt": consumption.total_power_watt,
+                "temperature": consumption.temperature,
+                "devices_on": consumption.devices_on,
+                "location": consumption.location
+            })
+        
+        return data
+
+    @staticmethod
+    async def fetch_ai_prediction(user_id: PyObjectId) -> Optional[Prediction]:
+        """Fetch prediction from external AI service"""
+        try:
+            # Get recent consumption data
+            consumption_data = await AIService.get_user_consumption_data(user_id)
+            
+            if not consumption_data:
+                logger.warning(f"No consumption data found for user {user_id}")
+                return None
+            
+            # Prepare request to AI service
+            request_data = {
+                "user_id": str(user_id),
+                "consumption_data": consumption_data,
+                "prediction_type": "daily",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            async with httpx.AsyncClient(timeout=settings.AI_SERVICE_TIMEOUT) as client:
+                response = await client.post(
+                    f"{settings.AI_SERVICE_URL}/predict",
+                    json=request_data
+                )
+                
+                if response.status_code == 200:
+                    ai_response = response.json()
+                    
+                    # Store prediction
+                    prediction = Prediction(
+                        user_id=user_id,
+                        prediction_type=ai_response.get("prediction_type", "daily"),
+                        suggestions=ai_response.get("suggestions", []),
+                        timestamp=datetime.utcnow(),
+                        source="external_ai_service"
+                    )
+                    
+                    predictions_collection = get_collection("predictions")
+                    await predictions_collection.insert_one(prediction.dict(by_alias=True))
+                    
+                    logger.info(f"AI prediction stored for user {user_id}")
+                    return prediction
+                else:
+                    logger.error(f"AI service error: {response.status_code} - {response.text}")
+                    return None
+                    
+        except httpx.RequestError as e:
+            logger.error(f"AI service request failed: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error in AI service: {str(e)}")
+            return None
+
+    @staticmethod
+    async def get_user_predictions(
+        user_id: PyObjectId, 
+        limit: int = 10
+    ) -> List[Prediction]:
+        """Get user prediction history"""
+        predictions_collection = get_collection("predictions")
+        cursor = predictions_collection.find({"user_id": user_id})\
+            .sort("timestamp", -1)\
+            .limit(limit)
+        
+        predictions = []
+        async for doc in cursor:
+            predictions.append(Prediction(**doc))
+        return predictions
+
+    @staticmethod
+    async def send_usage_history(user_id: PyObjectId, data: Dict[str, Any]) -> bool:
+        """Send usage history to AI service for training/analysis"""
+        try:
+            request_data = {
+                "user_id": str(user_id),
+                "usage_data": data,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            async with httpx.AsyncClient(timeout=settings.AI_SERVICE_TIMEOUT) as client:
+                response = await client.post(
+                    f"{settings.AI_SERVICE_URL}/usage-history",
+                    json=request_data
+                )
+                
+                return response.status_code == 200
+                
+        except Exception as e:
+            logger.error(f"Error sending usage history: {str(e)}")
+            return False
+
+
+==================== app/services/consumption_service.py ====================
+from typing import List, Dict, Any
+from datetime import datetime, timedelta
+from app.database import get_collection
+from app.models import Consumption, PyObjectId, ConsumptionAggregation
+from app.utils import watt_to_kwh
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ConsumptionService:
+    @staticmethod
+    async def create_consumption(consumption: Consumption) -> bool:
+        """Store consumption data"""
+        consumptions_collection = get_collection("consumptions")
+        result = await consumptions_collection.insert_one(consumption.dict(by_alias=True))
+        return result.acknowledged
+
+    @staticmethod
+    async def get_hourly_consumption(user_id: PyObjectId, date: datetime) -> List[ConsumptionAggregation]:
+        """Get hourly consumption aggregation for a specific date"""
+        consumptions_collection = get_collection("consumptions")
+        
+        start_of_day = datetime(date.year, date.month, date.day)
+        end_of_day = start_of_day + timedelta(days=1)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "user_id": user_id,
+                    "timestamp": {
+                        "$gte": start_of_day,
+                        "$lt": end_of_day
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "year": {"$year": "$timestamp"},
+                        "month": {"$month": "$timestamp"},
+                        "day": {"$dayOfMonth": "$timestamp"},
+                        "hour": {"$hour": "$timestamp"}
+                    },
+                    "total_consumption_kwh": {"$sum": "$power_usage_kwh"},
+                    "average_power_watt": {"$avg": "$total_power_watt"},
+                    "timestamp": {"$first": "$timestamp"}
+                }
+            },
+            {
+                "$sort": {"_id.hour": 1}
+            }
+        ]
+        
+        aggregations = []
+        async for doc in consumptions_collection.aggregate(pipeline):
+            aggregations.append(ConsumptionAggregation(
+                period=f"{doc['_id']['hour']:02d}:00",
+                total_consumption_kwh=doc["total_consumption_kwh"],
+                average_power_watt=doc["average_power_watt"],
+                timestamp=doc["timestamp"]
+            ))
+        
+        return aggregations
+
+    @staticmethod
+    async def get_daily_consumption(user_id: PyObjectId, year: int, month: int) -> List[ConsumptionAggregation]:
+        """Get daily consumption aggregation for a specific month"""
+        consumptions_collection = get_collection("consumptions")
+        
+        start_of_month = datetime(year, month, 1)
+        if month == 12:
+            end_of_month = datetime(year + 1, 1, 1)
+        else:
+            end_of_month = datetime(year, month + 1, 1)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "user_id": user_id,
+                    "timestamp": {
+                        "$gte": start_of_month,
+                        "$lt": end_of_month
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "year": {"$year": "$timestamp"},
+                        "month": {"$month": "$timestamp"},
+                        "day": {"$dayOfMonth": "$timestamp"}
+                    },
+                    "total_consumption_kwh": {"$sum": "$power_usage_kwh"},
+                    "average_power_watt": {"$avg": "$total_power_watt"},
+                    "timestamp": {"$first": "$timestamp"}
+                }
+            },
+            {
+                "$sort": {"_id.day": 1}
+            }
+        ]
+        
+        aggregations = []
+        async for doc in consumptions_collection.aggregate(pipeline):
+            aggregations.append(ConsumptionAggregation(
+                period=f"{doc['_id']['year']}-{doc['_id']['month']:02d}-{doc['_id']['day']:02d}",
+                total_consumption_kwh=doc["total_consumption_kwh"],
+                average_power_watt=doc["average_power_watt"],
+                timestamp=doc["timestamp"]
+            ))
+        
+        return aggregations
+
+    @staticmethod
+    async def get_monthly_consumption(user_id: PyObjectId, year: int) -> List[ConsumptionAggregation]:
+        """Get monthly consumption aggregation for a specific year"""
+        consumptions_collection = get_collection("consumptions")
+        
+        start_of_year = datetime(year, 1, 1)
+        end_of_year = datetime(year + 1, 1, 1)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "user_id": user_id,
+                    "timestamp": {
+                        "$gte": start_of_year,
+                        "$lt": end_of_year
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "year": {"$year": "$timestamp"},
+                        "month": {"$month": "$timestamp"}
+                    },
+                    "total_consumption_kwh": {"$sum": "$power_usage_kwh"},
+                    "average_power_watt": {"$avg": "$total_power_watt"},
+                    "timestamp": {"$first": "$timestamp"}
+                }
+            },
+            {
+                "$sort": {"_id.month": 1}
+            }
+        ]
+        
+        aggregations = []
+        async for doc in consumptions_collection.aggregate(pipeline):
+            aggregations.append(ConsumptionAggregation(
+                period=f"{doc['_id']['year']}-{doc['_id']['month']:02d}",
+                total_consumption_kwh=doc["total_consumption_kwh"],
+                average_power_watt=doc["average_power_watt"],
+                timestamp=doc["timestamp"]
+            ))
+        
+        return aggregations
+
+    @staticmethod
+    async def get_total_consumption_today(user_id: PyObjectId) -> float:
+        """Get total consumption for today"""
+        consumptions_collection = get_collection("consumptions")
+        
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "user_id": user_id,
+                    "timestamp": {
+                        "$gte": today,
+                        "$lt": tomorrow
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "total_consumption": {"$sum": "$power_usage_kwh"}
+                }
+            }
+        ]
+        
+        result = await consumptions_collection.aggregate(pipeline).to_list(length=1)
+        if result:
+            return result[0]["total_consumption"]
+        return 0.0
+
+
+==================== app/services/alert_service.py ====================
+from typing import List, Optional
+from datetime import datetime
+from app.database import get_collection
+from app.models import Alert, PyObjectId
+from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class AlertService:
+    _triggered_thresholds = {}  # Track triggered alerts per user
+
+    @staticmethod
+    async def create_alert(
+        user_id: PyObjectId,
+        alert_type: str,
+        percentage: float,
+        message: str,
+        auto_triggered: bool = True,
+    ) -> bool:
+        """Create a new alert"""
+        alerts_collection = get_collection("alerts")
+
+        alert = Alert(
+            user_id=user_id,
+            alert_type=alert_type,
+            percentage=percentage,
+            message=message,
+            timestamp=datetime.utcnow(),
+            auto_triggered=auto_triggered,
+        )
+
+        result = await alerts_collection.insert_one(alert.dict(by_alias=True))
+
+        if result.acknowledged:
+            logger.info(f"Alert created for user {user_id}: {alert_type} - {message}")
+            return True
+        return False
+
+    @staticmethod
+    async def check_and_create_alerts(
+        user_id: PyObjectId, percentage: float
+    ) -> List[str]:
+        """Check thresholds and create alerts if needed"""
+        from app.services.subscription_service import SubscriptionService
+
+        triggered_alerts = []
+        user_key = str(user_id)
+
+        # Check each threshold
+        thresholds = [
+            (
+                settings.WARNING_THRESHOLD * 100,
+                "WARNING",
+                "Energy package at 20% remaining",
+            ),
+            (
+                settings.CRITICAL_THRESHOLD * 100,
+                "CRITICAL",
+                "Energy package at 10% remaining - Save Mode activated",
+            ),
+            (
+                settings.FINAL_THRESHOLD * 100,
+                "FINAL",
+                "Energy package at 5% remaining - Immediate action required",
+            ),
+        ]
+
+        for threshold, alert_type, message in thresholds:
+            if (
+                percentage <= threshold
+                and user_key
+                not in AlertService._triggered_thresholds.get(alert_type, set())
+            ):
+
+                await AlertService.create_alert(
+                    user_id, alert_type, percentage, message
+                )
+                triggered_alerts.append(alert_type)
+
+                # Mark this threshold as triggered for this user
+                if alert_type not in AlertService._triggered_thresholds:
+                    AlertService._triggered_thresholds[alert_type] = set()
+                AlertService._triggered_thresholds[alert_type].add(user_key)
+
+        return triggered_alerts
+
+    @staticmethod
+    async def get_user_alerts(
+        user_id: PyObjectId, read: Optional[bool] = None, limit: int = 50
+    ) -> List[Alert]:
+        """Get user alerts with optional filters"""
+        alerts_collection = get_collection("alerts")
+        query = {"user_id": user_id}
+        if read is not None:
+            query["read"] = read
+
+        cursor = alerts_collection.find(query).sort("timestamp", -1).limit(limit)
+        alerts = []
+        async for doc in cursor:
+            alerts.append(Alert(**doc))
+        return alerts
+
+    @staticmethod
+    async def mark_alert_as_read(alert_id: PyObjectId, user_id: PyObjectId) -> bool:
+        """Mark an alert as read"""
+        alerts_collection = get_collection("alerts")
+        result = await alerts_collection.update_one(
+            {"_id": alert_id, "user_id": user_id}, {"$set": {"read": True}}
+        )
+        return result.modified_count > 0
+
+    @staticmethod
+    async def mark_all_alerts_as_read(user_id: PyObjectId) -> bool:
+        """Mark all user alerts as read"""
+        alerts_collection = get_collection("alerts")
+        result = await alerts_collection.update_many(
+            {"user_id": user_id, "read": False}, {"$set": {"read": True}}
+        )
+        return result.modified_count > 0
+
+    @staticmethod
+    async def get_unread_count(user_id: PyObjectId) -> int:
+        """Get count of unread alerts"""
+        alerts_collection = get_collection("alerts")
+        return await alerts_collection.count_documents(
+            {"user_id": user_id, "read": False}
+        )
+
+
+
+==================== app/services/subscription_service.py ====================
+from typing import Optional, List
+from datetime import datetime, timedelta
+from app.database import get_collection
+from app.models import Subscription, PyObjectId, Plan, PlanResponse
+from app.utils import calculate_percentage_remaining, log_energy_event
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class SubscriptionService:
+    @staticmethod
+    def get_available_plans() -> List[PlanResponse]:
+        """Get available subscription plans"""
+        return [
+            PlanResponse(
+                id="basic",
+                name="Basic Plan",
+                total_kwh=50,
+                price=10.0,
+                duration_days=30,
+                features=["Basic consumption reports", "Daily consumption monitoring"],
+            ),
+            PlanResponse(
+                id="standard",
+                name="Standard Plan",
+                total_kwh=100,
+                price=18.0,
+                duration_days=30,
+                features=[
+                    "Basic consumption reports",
+                    "Daily consumption monitoring",
+                    "Consumption alerts",
+                    "Auto save mode",
+                ],
+            ),
+            PlanResponse(
+                id="premium",
+                name="Premium Plan",
+                total_kwh=200,
+                price=30.0,
+                duration_days=30,
+                features=[
+                    "Basic consumption reports",
+                    "Daily consumption monitoring",
+                    "Consumption alerts",
+                    "Auto save mode",
+                    "AI predictions",
+                    "Premium support",
+                ],
+            ),
+        ]
+
+    @staticmethod
+    async def create_subscription_from_plan(user_id: PyObjectId, plan_id: str) -> bool:
+        """Create a new subscription from a plan"""
+        available_plans = SubscriptionService.get_available_plans()
+        selected_plan = next(
+            (plan for plan in available_plans if plan.id == plan_id), None
+        )
+
+        if not selected_plan:
+            return False
+
+        subscriptions_collection = get_collection("subscriptions")
+
+        # حساب تاريخ الانتهاء بناءً على مدة الباقة
+        start_date = datetime.utcnow()
+        end_date = start_date + timedelta(days=selected_plan.duration_days)
+
+        subscription = Subscription(
+            user_id=user_id,
+            plan_id=selected_plan.id,
+            plan_name=selected_plan.name,
+            total_kwh=selected_plan.total_kwh,
+            remaining_kwh=selected_plan.total_kwh,
+            price=selected_plan.price,
+            start_date=start_date,
+            end_date=end_date,
+            status="active",
+        )
+
+        result = await subscriptions_collection.insert_one(
+            subscription.dict(by_alias=True)
+        )
+        return result.acknowledged
+
+    @staticmethod
+    async def upgrade_plan(user_id: PyObjectId, new_plan_id: str) -> bool:
+        """Upgrade user's subscription to a new plan"""
+        available_plans = SubscriptionService.get_available_plans()
+        new_plan = next(
+            (plan for plan in available_plans if plan.id == new_plan_id), None
+        )
+
+        if not new_plan:
+            return False
+
+        subscriptions_collection = get_collection("subscriptions")
+
+        # إلغاء تفعيل الباقة الحالية
+        await subscriptions_collection.update_many(
+            {"user_id": user_id, "status": "active"}, {"$set": {"status": "expired"}}
+        )
+
+        # إنشاء باقة جديدة
+        start_date = datetime.utcnow()
+        end_date = start_date + timedelta(days=new_plan.duration_days)
+
+        new_subscription = Subscription(
+            user_id=user_id,
+            plan_id=new_plan.id,
+            plan_name=new_plan.name,
+            total_kwh=new_plan.total_kwh,
+            remaining_kwh=new_plan.total_kwh,
+            price=new_plan.price,
+            start_date=start_date,
+            end_date=end_date,
+            status="active",
+        )
+
+        result = await subscriptions_collection.insert_one(
+            new_subscription.dict(by_alias=True)
+        )
+
+        if result.acknowledged:
+            log_energy_event(
+                str(user_id),
+                "PLAN_UPGRADED",
+                f"Upgraded to {new_plan.name} with {new_plan.total_kwh}kWh",
+            )
+            return True
+        return False
+
+    # ⬅️ الطرق الحالية تبقى كما هي مع تعديلات بسيطة
+    @staticmethod
+    async def get_active_subscription(user_id: PyObjectId) -> Optional[Subscription]:
+        """Get user's active subscription"""
+        subscriptions_collection = get_collection("subscriptions")
+        subscription_data = await subscriptions_collection.find_one(
+            {
+                "user_id": user_id,
+                "status": "active",
+                "end_date": {"$gte": datetime.utcnow()},
+            }
+        )
+
+        if subscription_data:
+            return Subscription(**subscription_data)
+        return None
+
+    @staticmethod
+    async def deduct_energy(user_id: PyObjectId, kwh_used: float) -> bool:
+        """Deduct energy consumption from subscription"""
+        subscription = await SubscriptionService.get_active_subscription(user_id)
+        if not subscription:
+            logger.warning(f"No active subscription found for user {user_id}")
+            return False
+
+        if subscription.remaining_kwh < kwh_used:
+            logger.warning(f"Insufficient energy for user {user_id}")
+            return False
+
+        subscriptions_collection = get_collection("subscriptions")
+        result = await subscriptions_collection.update_one(
+            {"_id": subscription.id}, {"$inc": {"remaining_kwh": -kwh_used}}
+        )
+
+        if result.modified_count > 0:
+            new_remaining = subscription.remaining_kwh - kwh_used
+            percentage = calculate_percentage_remaining(
+                new_remaining, subscription.total_kwh
+            )
+
+            log_energy_event(
+                str(user_id),
+                "ENERGY_DEDUCTED",
+                f"Deducted {kwh_used}kWh, remaining: {new_remaining}kWh ({percentage:.1f}%)",
+            )
+
+            return True
+
+        return False
+
+    @staticmethod
+    async def get_subscription_percentage(user_id: PyObjectId) -> Optional[float]:
+        """Get percentage of remaining energy"""
+        subscription = await SubscriptionService.get_active_subscription(user_id)
+        if not subscription:
+            return None
+
+        return calculate_percentage_remaining(
+            subscription.remaining_kwh, subscription.total_kwh
+        )
+
+    @staticmethod
+    async def get_user_subscriptions(user_id: PyObjectId) -> List[Subscription]:
+        """Get all user subscriptions"""
+        subscriptions_collection = get_collection("subscriptions")
+        cursor = subscriptions_collection.find({"user_id": user_id}).sort(
+            "start_date", -1
+        )
+        subscriptions = []
+        async for doc in cursor:
+            subscriptions.append(Subscription(**doc))
+        return subscriptions
+
+    @staticmethod
+    async def create_subscription(subscription: Subscription) -> bool:
+        """Create a new subscription (للتوافق مع الكود القديم)"""
+        subscriptions_collection = get_collection("subscriptions")
+        result = await subscriptions_collection.insert_one(
+            subscription.dict(by_alias=True)
+        )
+        return result.acknowledged
+
+
+
+==================== app/services/save_mode_service.py ====================
+from typing import Optional, Dict, Any
+from datetime import datetime
+from app.database import get_collection
+from app.models import User, PyObjectId, SaveModeCommand
+from app.utils import log_energy_event
+import logging
+from typing import List
+
+
+logger = logging.getLogger(__name__)
+
+class SaveModeService:
+    @staticmethod
+    async def enable_save_mode(user_id: PyObjectId, reason: str) -> bool:
+        """Enable save mode for user"""
+        users_collection = get_collection("users")
+        result = await users_collection.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "save_mode": True,
+                "save_mode_reason": reason,
+                "save_mode_activated_at": datetime.utcnow()
+            }}
+        )
+        
+        if result.modified_count > 0:
+            log_energy_event(str(user_id), "SAVE_MODE_ENABLED", f"Reason: {reason}")
+            logger.info(f"Save mode enabled for user {user_id}, reason: {reason}")
+            return True
+        return False
+
+    @staticmethod
+    async def disable_save_mode(user_id: PyObjectId) -> bool:
+        """Disable save mode for user"""
+        users_collection = get_collection("users")
+        result = await users_collection.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "save_mode": False,
+                "save_mode_reason": None
+            }}
+        )
+        
+        if result.modified_count > 0:
+            log_energy_event(str(user_id), "SAVE_MODE_DISABLED", "Manual disable")
+            logger.info(f"Save mode disabled for user {user_id}")
+            return True
+        return False
+
+    @staticmethod
+    async def get_save_mode_status(user_id: PyObjectId) -> Dict[str, Any]:
+        """Get save mode status and commands"""
+        users_collection = get_collection("users")
+        user_data = await users_collection.find_one({"_id": user_id})
+        
+        if not user_data:
+            return {"save_mode": False, "command": None}
+        
+        user = User(**user_data)
+        
+        if user.save_mode:
+            command = SaveModeCommand(
+                devices_to_turn_off=SaveModeService._get_devices_to_turn_off(user)
+            )
+            return {
+                "save_mode": True,
+                "reason": user.save_mode_reason,
+                "command": command.dict()
+            }
+        else:
+            return {"save_mode": False, "command": None}
+
+    @staticmethod
+    def _get_devices_to_turn_off(user: User) -> List[str]:
+        """Determine which devices to turn off based on user preferences"""
+        base_devices = ["AC", "Heater", "WaterBoiler"]
+        
+        # Adjust based on user preferences
+        if user.preferred_temp > 22:
+            # If user prefers warmer temps, don't turn off heater
+            base_devices = [device for device in base_devices if device != "Heater"]
+        else:
+            # If user prefers cooler temps, don't turn off AC
+            base_devices = [device for device in base_devices if device != "AC"]
+            
+        return base_devices
+
+    @staticmethod
+    async def process_low_energy_save_mode(user_id: PyObjectId, percentage: float) -> bool:
+        """Automatically enable save mode for low energy"""
+        from app.config import settings
+        
+        if percentage <= settings.CRITICAL_THRESHOLD * 100:
+            return await SaveModeService.enable_save_mode(
+                user_id, 
+                "auto_low_package"
+            )
+        return False
+
+
+==================== app/utils.py ====================
+from datetime import datetime, timedelta
+from typing import Optional, Any, Dict
+from jose import JWTError, jwt
+import bcrypt
+from app.config import settings
+import logging
+
+# Logger setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        # Ensure password is encoded to bytes and check against hash
+        return bcrypt.checkpw(
+            plain_password.encode('utf-8'), 
+            hashed_password.encode('utf-8')
+        )
+    except Exception as e:
+        logger.error(f"Password verification error: {str(e)}")
+        return False
+
+def get_password_hash(password: str) -> str:
+    try:
+        # Encode password to bytes, hash it, and return as string
+        password_bytes = password.encode('utf-8')
+        
+        # Truncate if longer than 72 bytes for bcrypt
+        if len(password_bytes) > 72:
+            password_bytes = password_bytes[:72]
+            logger.warning("Password truncated to 72 bytes for bcrypt")
+            
+        hashed = bcrypt.hashpw(password_bytes, bcrypt.gensalt())
+        return hashed.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Password hashing error: {str(e)}")
+        raise
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str) -> Optional[Dict[str, Any]]:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+def watt_to_kwh(watt: float, hours: float = 1.0) -> float:
+    """Convert watts to kWh"""
+    return (watt * hours) / 1000
+
+def calculate_percentage_remaining(remaining: float, total: float) -> float:
+    """Calculate percentage remaining"""
+    if total <= 0:
+        return 0
+    return (remaining / total) * 100
+
+def format_timestamp_for_ai(timestamp: datetime) -> str:
+    """Format timestamp for AI service"""
+    return timestamp.isoformat()
+
+def log_energy_event(user_id: str, event_type: str, details: str):
+    """Log energy-related events"""
+    logger.info(f"Energy Event - User: {user_id}, Type: {event_type}, Details: {details}")
+
+
+==================== app/routers/consumptions.py ====================
+from typing import List
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.database import get_collection
+from app.auth import get_current_active_user
+from app.models import User, Consumption, SensorData, ConsumptionAggregation, PyObjectId
+from app.utils import watt_to_kwh
+from app.services.consumption_service import ConsumptionService
+from app.services.subscription_service import SubscriptionService
+from app.services.alert_service import AlertService
+from app.services.save_mode_service import SaveModeService
+from app.services.ai_service import AIService
+import logging
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+@router.post("/sensor/data")
+async def receive_sensor_data(sensor_data: SensorData):
+    """استقبال بيانات الاستهلاك من العداد باستخدام meter_id فقط"""
+    try:
+        # البحث عن المستخدم باستخدام meter_id فقط
+        users_collection = get_collection("users")
+        user_data = await users_collection.find_one({"meter_id": sensor_data.meter_id})
+
+        if not user_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Meter ID not registered"
+            )
+
+        user = User(**user_data)
+
+        # Convert watt to kWh (assuming 1 hour measurement)
+        power_usage_kwh = watt_to_kwh(sensor_data.total_power_watt)
+
+        # Create consumption record
+        consumption = Consumption(
+            user_id=user.id,
+            device_id=sensor_data.device_id,
+            power_usage_kwh=power_usage_kwh,
+            total_power_watt=sensor_data.total_power_watt,
+            timestamp=sensor_data.timestamp or datetime.utcnow(),
+            temperature=sensor_data.temperature,
+            devices_on=sensor_data.devices_on,
+            devices_off=sensor_data.devices_off,  # ⬅️ تم الإضافة
+            location=sensor_data.location,
+        )
+
+        # Store consumption
+        await ConsumptionService.create_consumption(consumption)
+
+        # Deduct from subscription
+        deduction_success = await SubscriptionService.deduct_energy(
+            user.id, power_usage_kwh
+        )
+
+        if not deduction_success:
+            logger.warning(f"Failed to deduct energy for user {user.id}")
+
+        # Check subscription percentage and trigger alerts
+        percentage = await SubscriptionService.get_subscription_percentage(user.id)
+        if percentage is not None:
+            # Check and create alerts
+            triggered_alerts = await AlertService.check_and_create_alerts(
+                user.id, percentage
+            )
+
+            # Auto-enable save mode if critical threshold reached
+            if "CRITICAL" in triggered_alerts:
+                await SaveModeService.process_low_energy_save_mode(user.id, percentage)
+
+        # Trigger AI prediction (async - don't wait for response)
+        import asyncio
+
+        asyncio.create_task(AIService.fetch_ai_prediction(user.id))
+
+        return {
+            "status": "success",
+            "message": "Sensor data processed successfully",
+            "kwh_used": power_usage_kwh,
+            "user_id": str(user.id),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing sensor data: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error processing sensor data",
+        )
+
+
+@router.get("/user/{user_id}/hourly", response_model=List[ConsumptionAggregation])
+async def get_hourly_consumption(
+    user_id: str, date: datetime, current_user: User = Depends(get_current_active_user)
+):
+    """Get hourly consumption for a specific date"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    return await ConsumptionService.get_hourly_consumption(PyObjectId(user_id), date)
+
+
+@router.get("/user/{user_id}/daily", response_model=List[ConsumptionAggregation])
+async def get_daily_consumption(
+    user_id: str,
+    year: int,
+    month: int,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Get daily consumption for a specific month"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    return await ConsumptionService.get_daily_consumption(
+        PyObjectId(user_id), year, month
+    )
+
+
+@router.get("/user/{user_id}/monthly", response_model=List[ConsumptionAggregation])
+async def get_monthly_consumption(
+    user_id: str, year: int, current_user: User = Depends(get_current_active_user)
+):
+    """Get monthly consumption for a specific year"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    return await ConsumptionService.get_monthly_consumption(PyObjectId(user_id), year)
+
+
+@router.get("/user/{user_id}/today")
+async def get_today_consumption(
+    user_id: str, current_user: User = Depends(get_current_active_user)
+):
+    """Get today's total consumption"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    total_consumption = await ConsumptionService.get_total_consumption_today(
+        PyObjectId(user_id)
+    )
+    return {"total_consumption_kwh": total_consumption}
+
+
+
+==================== app/routers/subscriptions.py ====================
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.auth import get_current_active_user
+from app.models import User, Subscription, PlanResponse, UpgradePlanRequest
+from app.services.subscription_service import SubscriptionService
+from app.database import get_collection
+
+router = APIRouter()
+
+
+@router.get("/plans", response_model=List[PlanResponse])
+async def get_available_plans():
+    """Get available subscription plans"""
+    return SubscriptionService.get_available_plans()  # ⬅️ بدون await
+
+
+@router.get("/my-subscriptions", response_model=List[Subscription])
+async def get_my_subscriptions(current_user: User = Depends(get_current_active_user)):
+    """Get current user's subscriptions"""
+    return await SubscriptionService.get_user_subscriptions(current_user.id)
+
+
+@router.get("/active")
+async def get_active_subscription(
+    current_user: User = Depends(get_current_active_user),
+):
+    """Get user's active subscription"""
+    subscription = await SubscriptionService.get_active_subscription(current_user.id)
+
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No active subscription found"
+        )
+
+    return subscription
+
+
+@router.post("/upgrade")
+async def upgrade_plan(
+    upgrade_request: UpgradePlanRequest,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Upgrade user's subscription plan"""
+    # التحقق من صحة الباقة المختارة
+    available_plans = SubscriptionService.get_available_plans()  # ⬅️ بدون await
+    if upgrade_request.plan_id not in [plan.id for plan in available_plans]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan ID"
+        )
+
+    # ترقية الباقة
+    success = await SubscriptionService.upgrade_plan(
+        user_id=current_user.id, new_plan_id=upgrade_request.plan_id
+    )
+
+    if success:
+        # تحديث الباقة المختارة في بيانات المستخدم
+        users_collection = get_collection("users")
+        await users_collection.update_one(
+            {"_id": current_user.id},
+            {"$set": {"selected_plan": upgrade_request.plan_id}},
+        )
+
+        return {
+            "status": "success",
+            "message": f"Plan upgraded to {upgrade_request.plan_id}",
+            "new_plan": upgrade_request.plan_id,
+        }
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to upgrade plan",
+        )
+
+
+@router.get("/my-plan")
+async def get_my_plan(current_user: User = Depends(get_current_active_user)):
+    """Get current user's active plan details"""
+    active_subscription = await SubscriptionService.get_active_subscription(
+        current_user.id
+    )
+    if not active_subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No active subscription found"
+        )
+
+    # الحصول على تفاصيل الباقة
+    available_plans = SubscriptionService.get_available_plans()  # ⬅️ بدون await
+    plan_details = next(
+        (plan for plan in available_plans if plan.id == active_subscription.plan_id),
+        None,
+    )
+
+    if not plan_details:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Plan details not found"
+        )
+
+    return {"subscription": active_subscription, "plan_details": plan_details}
+
+
+
+==================== app/routers/users.py ====================
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.database import get_collection
+from app.auth import get_current_active_user
+from app.models import User, UserResponse, UserCreate, PyObjectId
+from app.utils import get_password_hash
+from app.services.subscription_service import SubscriptionService
+
+router = APIRouter()
+
+
+@router.post("/register", response_model=UserResponse)
+async def register_user(user_data: UserCreate):
+    """Register a new user"""
+    users_collection = get_collection("users")
+
+    # Check if user already exists
+    existing_user = await users_collection.find_one({"email": user_data.email})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User with this email already exists",
+        )
+
+    # Check if meter_id already exists
+    existing_meter = await users_collection.find_one({"meter_id": user_data.meter_id})
+    if existing_meter:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Meter ID already registered",
+        )
+
+    # ⬅️ تم الإضافة: التحقق من صحة الباقة المختارة
+    available_plans = await SubscriptionService.get_available_plans()
+    if user_data.selected_plan not in [plan.id for plan in available_plans]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan selected"
+        )
+
+    # Create user
+    user = User(
+        name=user_data.name,
+        email=user_data.email,
+        hashed_password=get_password_hash(user_data.password),
+        building_type=user_data.building_type,
+        preferred_temp=user_data.preferred_temp,
+        energy_goal=user_data.energy_goal,
+        meter_id=user_data.meter_id,
+        selected_plan=user_data.selected_plan,  # ⬅️ تم الإضافة
+    )
+
+    result = await users_collection.insert_one(user.dict(by_alias=True))
+
+    # ⬅️ تم التعديل: إنشاء الباقة بناءً على الخطة المختارة
+    subscription_success = await SubscriptionService.create_subscription_from_plan(
+        user_id=result.inserted_id, plan_id=user_data.selected_plan
+    )
+
+    if not subscription_success:
+        # If subscription creation fails, delete the user
+        await users_collection.delete_one({"_id": result.inserted_id})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create subscription",
+        )
+
+    return UserResponse(
+        id=str(result.inserted_id),
+        name=user.name,
+        email=user.email,
+        building_type=user.building_type,
+        preferred_temp=user.preferred_temp,
+        energy_goal=user.energy_goal,
+        save_mode=user.save_mode,
+        meter_id=user.meter_id,
+        selected_plan=user.selected_plan,  # ⬅️ تم الإضافة
+    )
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user(current_user: User = Depends(get_current_active_user)):
+    """Get current user information"""
+    return UserResponse(
+        id=str(current_user.id),
+        name=current_user.name,
+        email=current_user.email,
+        building_type=current_user.building_type,
+        preferred_temp=current_user.preferred_temp,
+        energy_goal=current_user.energy_goal,
+        save_mode=current_user.save_mode,
+        meter_id=current_user.meter_id,
+        selected_plan=current_user.selected_plan,  # ⬅️ تم الإضافة
+    )
+
+
+@router.get("/{user_id}/subscription/percentage")
+async def get_subscription_percentage(
+    user_id: str, current_user: User = Depends(get_current_active_user)
+):
+    """Get user's subscription percentage"""
+    if current_user.id != PyObjectId(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this resource",
+        )
+
+    percentage = await SubscriptionService.get_subscription_percentage(
+        PyObjectId(user_id)
+    )
+    if percentage is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No active subscription found"
+        )
+
+    return {"percentage": percentage}
+
+
+
+==================== app/routers/predictions.py ====================
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.auth import get_current_active_user
+from app.models import User, Prediction
+from app.services.ai_service import AIService
+
+router = APIRouter()
+
+@router.get("/my-predictions", response_model=List[Prediction])
+async def get_my_predictions(current_user: User = Depends(get_current_active_user)):
+    """Get user's prediction history"""
+    return await AIService.get_user_predictions(current_user.id)
+
+@router.post("/refresh")
+async def refresh_prediction(current_user: User = Depends(get_current_active_user)):
+    """Trigger a new prediction from AI service"""
+    prediction = await AIService.fetch_ai_prediction(current_user.id)
+    
+    if prediction:
+        return {
+            "status": "success", 
+            "message": "Prediction generated",
+            "prediction_id": str(prediction.id)
+        }
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate prediction"
+        )
+
+
+==================== app/routers/devices.py ====================
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.auth import get_current_active_user
+from app.models import User, SaveModeRequest
+from app.services.save_mode_service import SaveModeService
+
+router = APIRouter()
+
+
+# -----------------------------
+# Save Mode endpoints only
+# -----------------------------
+@router.post("/save_mode")
+async def toggle_save_mode(
+    request: SaveModeRequest, current_user: User = Depends(get_current_active_user)
+):
+    success = await SaveModeService.enable_save_mode(current_user.id, request.reason)
+    if success:
+        return {"status": "success", "message": f"Save mode enabled: {request.reason}"}
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to enable save mode",
+        )
+
+
+@router.delete("/save_mode")
+async def disable_save_mode(current_user: User = Depends(get_current_active_user)):
+    success = await SaveModeService.disable_save_mode(current_user.id)
+    if success:
+        return {"status": "success", "message": "Save mode disabled"}
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to disable save mode",
+        )
+
+
+@router.get("/save_mode/status")
+async def get_save_mode_status(current_user: User = Depends(get_current_active_user)):
+    status_info = await SaveModeService.get_save_mode_status(current_user.id)
+    return status_info
+
+
+@router.get("/get_commands")
+async def get_device_commands(current_user: User = Depends(get_current_active_user)):
+    status_info = await SaveModeService.get_save_mode_status(current_user.id)
+    if status_info["save_mode"]:
+        return {
+            "commands": [status_info["command"]],
+            "timestamp": status_info.get("activated_at"),
+        }
+    else:
+        return {"commands": []}
+
+
+
+==================== app/routers/auth.py ====================
+from datetime import timedelta
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from app.database import get_collection
+from app.models import Token, UserCreate
+from app.utils import verify_password, create_access_token
+from app.config import settings
+
+router = APIRouter()
+
+@router.post("/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """User login"""
+    users_collection = get_collection("users")
+    user = await users_collection.find_one({"email": form_data.username})
+    
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["email"]}, expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+==================== app/routers/alerts.py ====================
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.auth import get_current_active_user
+from app.models import User, Alert, PyObjectId
+from app.services.alert_service import AlertService
+
+router = APIRouter()
+
+@router.get("/list", response_model=List[Alert])
+async def get_alerts(
+    read: Optional[bool] = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get user alerts with optional filters"""
+    return await AlertService.get_user_alerts(current_user.id, read, limit)
+
+@router.get("/latest")
+async def get_latest_alerts(current_user: User = Depends(get_current_active_user)):
+    """Get latest unread alerts"""
+    alerts = await AlertService.get_user_alerts(current_user.id, read=False, limit=10)
+    unread_count = await AlertService.get_unread_count(current_user.id)
+    
+    return {
+        "alerts": alerts,
+        "unread_count": unread_count
+    }
+
+@router.post("/mark-as-read/{alert_id}")
+async def mark_alert_as_read(
+    alert_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Mark a specific alert as read"""
+    success = await AlertService.mark_alert_as_read(PyObjectId(alert_id), current_user.id)
+    
+    if success:
+        return {"status": "success", "message": "Alert marked as read"}
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Alert not found"
+        )
+
+@router.post("/mark-all-read")
+async def mark_all_alerts_as_read(current_user: User = Depends(get_current_active_user)):
+    """Mark all user alerts as read"""
+    success = await AlertService.mark_all_alerts_as_read(current_user.id)
+    
+    if success:
+        return {"status": "success", "message": "All alerts marked as read"}
+    else:
+        return {"status": "success", "message": "No unread alerts"}
+
+
+==================== app/database.py ====================
+from motor.motor_asyncio import AsyncIOMotorClient
+from app.config import settings
+
+class Database:
+    client: AsyncIOMotorClient = None # type: ignore
+    database = None
+
+db = Database()
+
+async def connect_to_mongo():
+    db.client = AsyncIOMotorClient(settings.MONGODB_URL)
+    db.database = db.client[settings.MONGODB_DB_NAME]
+    print("Connected to MongoDB")
+
+async def close_mongo_connection():
+    if db.client:
+        db.client.close()
+        print("Disconnected from MongoDB")
+
+def get_database():
+    return db.database
+
+def get_collection(collection_name: str):
+    return db.database[collection_name]
+
+
+==================== app/config.py ====================
+import os
+from typing import Optional
+from pydantic import BaseSettings
+
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "HEMS Backend"
+    VERSION: str = "1.0.0"
+    API_V1_STR: str = "/api/v1"
+
+    # MongoDB
+    MONGODB_URL: str = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    MONGODB_DB_NAME: str = os.getenv("MONGODB_DB_NAME", "HEMS")
+
+    # JWT
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
+
+    # External AI Service
+    AI_SERVICE_URL: str = os.getenv("AI_SERVICE_URL", "http://localhost:8001")
+    AI_SERVICE_TIMEOUT: int = 30
+
+    # Alert Thresholds
+    WARNING_THRESHOLD: float = 0.2  # 20%
+    CRITICAL_THRESHOLD: float = 0.1  # 10%
+    FINAL_THRESHOLD: float = 0.05  # 5%
+
+    class Config:
+        case_sensitive = True
+
+
+settings = Settings()
+
+
+
+==================== app/auth.py ====================
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from app.database import get_collection
+from app.utils import verify_token
+from app.models import User
+
+security = HTTPBearer()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    payload = verify_token(credentials.credentials)
+    if payload is None:
+        raise credentials_exception
+        
+    email = payload.get("sub")
+    if email is None:
+        raise credentials_exception
+    
+    users_collection = get_collection("users")
+    user_data = await users_collection.find_one({"email": email})
+    if user_data is None:
+        raise credentials_exception
+        
+    return User(**user_data)
+
+async def get_current_active_user(current_user: User = Depends(get_current_user)):
+    return current_user
+
+
+==================== app/models.py ====================
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from pydantic import BaseModel, Field, EmailStr, validator
+from bson import ObjectId
+import json
+
+
+class PyObjectId(ObjectId):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid objectid")
+        return ObjectId(v)
+
+    @classmethod
+    def __modify_schema__(cls, field_schema):
+        field_schema.update(type="string")
+
+
+# ⬇️⬇️⬇️ النماذج الجديدة للباقات ⬇️⬇️⬇️
+class Plan(BaseModel):
+    id: str  # basic, standard, premium
+    name: str
+    total_kwh: float
+    price: float
+    duration_days: int
+    features: List[str]
+
+
+class PlanResponse(BaseModel):
+    id: str
+    name: str
+    total_kwh: float
+    price: float
+    duration_days: int
+    features: List[str]
+
+
+class User(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    name: str = Field(..., min_length=1, max_length=100)
+    email: EmailStr
+    hashed_password: str
+    building_type: str
+    preferred_temp: float = Field(24.0, ge=15.0, le=30.0)
+    energy_goal: Optional[str] = None
+    save_mode: bool = False
+    save_mode_reason: Optional[str] = None
+    meter_id: str = Field(...)
+    selected_plan: str = Field(default="basic")  # ⬅️ الجديد
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    building_type: str
+    preferred_temp: float = 24.0
+    energy_goal: Optional[str] = None
+    meter_id: str = Field(...)
+    selected_plan: str = Field(default="basic")  # ⬅️ الجديد
+
+
+class UserResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+    building_type: str
+    preferred_temp: float
+    energy_goal: Optional[str]
+    save_mode: bool
+    meter_id: str
+    selected_plan: str  # ⬅️ الجديد
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
+
+class Subscription(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    plan_id: str  # ⬅️ تحديث: نستخدم plan_id بدل plan_name
+    plan_name: str
+    total_kwh: float = Field(..., gt=0)
+    remaining_kwh: float = Field(..., ge=0)
+    price: float = Field(..., ge=0)  # ⬅️ تحديث: سعر الباقة
+    start_date: datetime
+    end_date: datetime
+    status: str
+
+    @validator("status")
+    def validate_status(cls, v):
+        if v not in ["active", "expired", "cancelled"]:
+            raise ValueError("Status must be active, expired, or cancelled")
+        return v
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class Consumption(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    device_id: str
+    power_usage_kwh: float = Field(..., ge=0)
+    total_power_watt: float = Field(..., ge=0)
+    timestamp: datetime
+    temperature: Optional[float] = None
+    devices_on: int = Field(..., ge=0)
+    devices_off: int = Field(..., ge=0)
+    location: str
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class Prediction(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    prediction_type: str
+    suggestions: List[str]
+    timestamp: datetime
+    source: str = "external_ai_service"
+
+    @validator("prediction_type")
+    def validate_prediction_type(cls, v):
+        if v not in ["daily", "weekly", "monthly"]:
+            raise ValueError("Prediction type must be daily, weekly, or monthly")
+        return v
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class Alert(BaseModel):
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    alert_type: str
+    percentage: float = Field(..., ge=0, le=100)
+    message: str
+    timestamp: datetime
+    read: bool = False
+    auto_triggered: bool = True
+
+    @validator("alert_type")
+    def validate_alert_type(cls, v):
+        if v not in ["WARNING", "CRITICAL", "FINAL"]:
+            raise ValueError("Alert type must be WARNING, CRITICAL, or FINAL")
+        return v
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+
+class SensorData(BaseModel):
+    device_id: str
+    meter_id: str
+    total_power_watt: float = Field(..., ge=0)
+    timestamp: Optional[datetime] = None
+    temperature: Optional[float] = None
+    devices_on: int = Field(..., ge=0)
+    devices_off: int = Field(..., ge=0)
+    location: str
+
+
+class SaveModeCommand(BaseModel):
+    action: str = "save_mode"
+    devices_to_turn_off: List[str] = ["AC", "Heater", "WaterBoiler"]
+    priority: str = "high"
+
+
+class SaveModeRequest(BaseModel):
+    reason: str
+
+    @validator("reason")
+    def validate_reason(cls, v):
+        if v not in ["manual", "auto_low_package"]:
+            raise ValueError("Reason must be manual or auto_low_package")
+        return v
+
+
+class ConsumptionAggregation(BaseModel):
+    period: str
+    total_consumption_kwh: float
+    average_power_watt: float
+    timestamp: datetime
+
+
+# ⬇️⬇️⬇️ نموذج لترقية الباقة ⬇️⬇️⬇️
+class UpgradePlanRequest(BaseModel):
+    plan_id: str
+
+    @validator("plan_id")
+    def validate_plan_id(cls, v):
+        if v not in ["basic", "standard", "premium"]:
+            raise ValueError("Plan ID must be basic, standard, or premium")
+        return v
+
+
+
+==================== app/main.py ====================
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.database import connect_to_mongo, close_mongo_connection
+from app.routers import (
+    users, auth, consumptions, devices, 
+    subscriptions, alerts, predictions
+)
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+)
+
+origins = ["*"]
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(auth.router, prefix=f"{settings.API_V1_STR}/auth", tags=["auth"])
+app.include_router(users.router, prefix=f"{settings.API_V1_STR}/users", tags=["users"])
+app.include_router(consumptions.router, prefix=f"{settings.API_V1_STR}/consumptions", tags=["consumptions"])
+app.include_router(devices.router, prefix=f"{settings.API_V1_STR}/devices", tags=["devices"])
+app.include_router(subscriptions.router, prefix=f"{settings.API_V1_STR}/subscriptions", tags=["subscriptions"])
+app.include_router(alerts.router, prefix=f"{settings.API_V1_STR}/alerts", tags=["alerts"])
+app.include_router(predictions.router, prefix=f"{settings.API_V1_STR}/predictions", tags=["predictions"])
+
+
+
+@app.on_event("startup")
+async def startup_event():
+    await connect_to_mongo()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_mongo_connection()
+
+@app.get("/")
+async def root():
+    return {
+        "message": "HEMS Backend API",
+        "version": settings.VERSION,
+        "docs": "/docs"
+    }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": "2024-01-01T00:00:00Z"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="192.168.10.129",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
+
+
+==================== app/services/device_service.py ====================
+import secrets
+from typing import List, Optional
+from datetime import datetime
+from app.database import get_collection
+from app.models import Device, PyObjectId
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class DeviceService:
+    @staticmethod
+    def generate_api_key() -> str:
+        """توليد مفتاح API عشوائي وآمن"""
+        return f"HEMS_{secrets.token_urlsafe(24)}"
+
+    @staticmethod
+    async def create_device(device: Device) -> bool:
+        """تسجيل جهاز جديد في النظام"""
+        devices_collection = get_collection("devices")
+
+        # التحقق من أن device_id غير مستخدم لنفس المستخدم
+        existing_device = await devices_collection.find_one(
+            {"device_id": device.device_id, "user_id": device.user_id}
+        )
+
+        if existing_device:
+            return False
+
+        result = await devices_collection.insert_one(device.dict(by_alias=True))
+        return result.acknowledged
+
+    @staticmethod
+    async def get_device_by_api_key(api_key: str) -> Optional[Device]:
+        """الحصول على بيانات الجهاز باستخدام API Key"""
+        devices_collection = get_collection("devices")
+        device_data = await devices_collection.find_one(
+            {"api_key": api_key, "is_active": True}
+        )
+
+        if device_data:
+            return Device(**device_data)
+        return None
+
+    @staticmethod
+    async def get_user_devices(user_id: PyObjectId) -> List[Device]:
+        """الحصول على جميع أجهزة المستخدم"""
+        devices_collection = get_collection("devices")
+        cursor = devices_collection.find({"user_id": user_id})
+
+        devices = []
+        async for doc in cursor:
+            devices.append(Device(**doc))
+        return devices
+
+    @staticmethod
+    async def deactivate_device(device_id: str, user_id: PyObjectId) -> bool:
+        """إبطال جهاز (حذف منطقي)"""
+        devices_collection = get_collection("devices")
+        result = await devices_collection.update_one(
+            {"device_id": device_id, "user_id": user_id}, {"$set": {"is_active": False}}
+        )
+        return result.modified_count > 0
+
+
+
+==================== app/services/ai_service.py ====================
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta
+import httpx
+from app.database import get_collection
+from app.models import Prediction, PyObjectId, Consumption
+from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+class AIService:
+    @staticmethod
+    async def get_user_consumption_data(user_id: PyObjectId, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get user consumption data for AI analysis"""
+        consumptions_collection = get_collection("consumptions")
+        
+        start_time = datetime.utcnow() - timedelta(hours=hours)
+        
+        cursor = consumptions_collection.find({
+            "user_id": user_id,
+            "timestamp": {"$gte": start_time}
+        }).sort("timestamp", 1)
+        
+        data = []
+        async for doc in cursor:
+            consumption = Consumption(**doc)
+            data.append({
+                "timestamp": consumption.timestamp.isoformat(),
+                "power_usage_kwh": consumption.power_usage_kwh,
+                "total_power_watt": consumption.total_power_watt,
+                "temperature": consumption.temperature,
+                "devices_on": consumption.devices_on,
+                "location": consumption.location
+            })
+        
+        return data
+
+    @staticmethod
+    async def fetch_ai_prediction(user_id: PyObjectId) -> Optional[Prediction]:
+        """Fetch prediction from external AI service"""
+        try:
+            # Get recent consumption data
+            consumption_data = await AIService.get_user_consumption_data(user_id)
+            
+            if not consumption_data:
+                logger.warning(f"No consumption data found for user {user_id}")
+                return None
+            
+            # Prepare request to AI service
+            request_data = {
+                "user_id": str(user_id),
+                "consumption_data": consumption_data,
+                "prediction_type": "daily",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            async with httpx.AsyncClient(timeout=settings.AI_SERVICE_TIMEOUT) as client:
+                response = await client.post(
+                    f"{settings.AI_SERVICE_URL}/predict",
+                    json=request_data
+                )
+                
+                if response.status_code == 200:
+                    ai_response = response.json()
+                    
+                    # Store prediction
+                    prediction = Prediction(
+                        user_id=user_id,
+                        prediction_type=ai_response.get("prediction_type", "daily"),
+                        suggestions=ai_response.get("suggestions", []),
+                        timestamp=datetime.utcnow(),
+                        source="external_ai_service"
+                    )
+                    
+                    predictions_collection = get_collection("predictions")
+                    await predictions_collection.insert_one(prediction.dict(by_alias=True))
+                    
+                    logger.info(f"AI prediction stored for user {user_id}")
+                    return prediction
+                else:
+                    logger.error(f"AI service error: {response.status_code} - {response.text}")
+                    return None
+                    
+        except httpx.RequestError as e:
+            logger.error(f"AI service request failed: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error in AI service: {str(e)}")
+            return None
+
+    @staticmethod
+    async def get_user_predictions(
+        user_id: PyObjectId, 
+        limit: int = 10
+    ) -> List[Prediction]:
+        """Get user prediction history"""
+        predictions_collection = get_collection("predictions")
+        cursor = predictions_collection.find({"user_id": user_id})\
+            .sort("timestamp", -1)\
+            .limit(limit)
+        
+        predictions = []
+        async for doc in cursor:
+            predictions.append(Prediction(**doc))
+        return predictions
+
+    @staticmethod
+    async def send_usage_history(user_id: PyObjectId, data: Dict[str, Any]) -> bool:
+        """Send usage history to AI service for training/analysis"""
+        try:
+            request_data = {
+                "user_id": str(user_id),
+                "usage_data": data,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            async with httpx.AsyncClient(timeout=settings.AI_SERVICE_TIMEOUT) as client:
+                response = await client.post(
+                    f"{settings.AI_SERVICE_URL}/usage-history",
+                    json=request_data
+                )
+                
+                return response.status_code == 200
+                
+        except Exception as e:
+            logger.error(f"Error sending usage history: {str(e)}")
+            return False
+
+
+==================== app/services/consumption_service.py ====================
+from typing import List, Dict, Any
+from datetime import datetime, timedelta
+from app.database import get_collection
+from app.models import Consumption, PyObjectId, ConsumptionAggregation
+from app.utils import watt_to_kwh
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ConsumptionService:
+    @staticmethod
+    async def create_consumption(consumption: Consumption) -> bool:
+        """Store consumption data"""
+        consumptions_collection = get_collection("consumptions")
+        result = await consumptions_collection.insert_one(consumption.dict(by_alias=True))
+        return result.acknowledged
+
+    @staticmethod
+    async def get_hourly_consumption(user_id: PyObjectId, date: datetime) -> List[ConsumptionAggregation]:
+        """Get hourly consumption aggregation for a specific date"""
+        consumptions_collection = get_collection("consumptions")
+        
+        start_of_day = datetime(date.year, date.month, date.day)
+        end_of_day = start_of_day + timedelta(days=1)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "user_id": user_id,
+                    "timestamp": {
+                        "$gte": start_of_day,
+                        "$lt": end_of_day
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "year": {"$year": "$timestamp"},
+                        "month": {"$month": "$timestamp"},
+                        "day": {"$dayOfMonth": "$timestamp"},
+                        "hour": {"$hour": "$timestamp"}
+                    },
+                    "total_consumption_kwh": {"$sum": "$power_usage_kwh"},
+                    "average_power_watt": {"$avg": "$total_power_watt"},
+                    "timestamp": {"$first": "$timestamp"}
+                }
+            },
+            {
+                "$sort": {"_id.hour": 1}
+            }
+        ]
+        
+        aggregations = []
+        async for doc in consumptions_collection.aggregate(pipeline):
+            aggregations.append(ConsumptionAggregation(
+                period=f"{doc['_id']['hour']:02d}:00",
+                total_consumption_kwh=doc["total_consumption_kwh"],
+                average_power_watt=doc["average_power_watt"],
+                timestamp=doc["timestamp"]
+            ))
+        
+        return aggregations
+
+    @staticmethod
+    async def get_daily_consumption(user_id: PyObjectId, year: int, month: int) -> List[ConsumptionAggregation]:
+        """Get daily consumption aggregation for a specific month"""
+        consumptions_collection = get_collection("consumptions")
+        
+        start_of_month = datetime(year, month, 1)
+        if month == 12:
+            end_of_month = datetime(year + 1, 1, 1)
+        else:
+            end_of_month = datetime(year, month + 1, 1)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "user_id": user_id,
+                    "timestamp": {
+                        "$gte": start_of_month,
+                        "$lt": end_of_month
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "year": {"$year": "$timestamp"},
+                        "month": {"$month": "$timestamp"},
+                        "day": {"$dayOfMonth": "$timestamp"}
+                    },
+                    "total_consumption_kwh": {"$sum": "$power_usage_kwh"},
+                    "average_power_watt": {"$avg": "$total_power_watt"},
+                    "timestamp": {"$first": "$timestamp"}
+                }
+            },
+            {
+                "$sort": {"_id.day": 1}
+            }
+        ]
+        
+        aggregations = []
+        async for doc in consumptions_collection.aggregate(pipeline):
+            aggregations.append(ConsumptionAggregation(
+                period=f"{doc['_id']['year']}-{doc['_id']['month']:02d}-{doc['_id']['day']:02d}",
+                total_consumption_kwh=doc["total_consumption_kwh"],
+                average_power_watt=doc["average_power_watt"],
+                timestamp=doc["timestamp"]
+            ))
+        
+        return aggregations
+
+    @staticmethod
+    async def get_monthly_consumption(user_id: PyObjectId, year: int) -> List[ConsumptionAggregation]:
+        """Get monthly consumption aggregation for a specific year"""
+        consumptions_collection = get_collection("consumptions")
+        
+        start_of_year = datetime(year, 1, 1)
+        end_of_year = datetime(year + 1, 1, 1)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "user_id": user_id,
+                    "timestamp": {
+                        "$gte": start_of_year,
+                        "$lt": end_of_year
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "year": {"$year": "$timestamp"},
+                        "month": {"$month": "$timestamp"}
+                    },
+                    "total_consumption_kwh": {"$sum": "$power_usage_kwh"},
+                    "average_power_watt": {"$avg": "$total_power_watt"},
+                    "timestamp": {"$first": "$timestamp"}
+                }
+            },
+            {
+                "$sort": {"_id.month": 1}
+            }
+        ]
+        
+        aggregations = []
+        async for doc in consumptions_collection.aggregate(pipeline):
+            aggregations.append(ConsumptionAggregation(
+                period=f"{doc['_id']['year']}-{doc['_id']['month']:02d}",
+                total_consumption_kwh=doc["total_consumption_kwh"],
+                average_power_watt=doc["average_power_watt"],
+                timestamp=doc["timestamp"]
+            ))
+        
+        return aggregations
+
+    @staticmethod
+    async def get_total_consumption_today(user_id: PyObjectId) -> float:
+        """Get total consumption for today"""
+        consumptions_collection = get_collection("consumptions")
+        
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
+        
+        pipeline = [
+            {
+                "$match": {
+                    "user_id": user_id,
+                    "timestamp": {
+                        "$gte": today,
+                        "$lt": tomorrow
+                    }
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "total_consumption": {"$sum": "$power_usage_kwh"}
+                }
+            }
+        ]
+        
+        result = await consumptions_collection.aggregate(pipeline).to_list(length=1)
+        if result:
+            return result[0]["total_consumption"]
+        return 0.0
+
+
+==================== app/services/alert_service.py ====================
+from typing import List, Optional
+from datetime import datetime
+from app.database import get_collection
+from app.models import Alert, PyObjectId
+from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class AlertService:
+    _triggered_thresholds = {}  # Track triggered alerts per user
+
+    @staticmethod
+    async def create_alert(
+        user_id: PyObjectId,
+        alert_type: str,
+        percentage: float,
+        message: str,
+        auto_triggered: bool = True,
+    ) -> bool:
+        """Create a new alert"""
+        alerts_collection = get_collection("alerts")
+
+        alert = Alert(
+            user_id=user_id,
+            alert_type=alert_type,
+            percentage=percentage,
+            message=message,
+            timestamp=datetime.utcnow(),
+            auto_triggered=auto_triggered,
+        )
+
+        result = await alerts_collection.insert_one(alert.dict(by_alias=True))
+
+        if result.acknowledged:
+            logger.info(f"Alert created for user {user_id}: {alert_type} - {message}")
+            return True
+        return False
+
+    @staticmethod
+    async def check_and_create_alerts(
+        user_id: PyObjectId, percentage: float
+    ) -> List[str]:
+        """Check thresholds and create alerts if needed"""
+        from app.services.subscription_service import SubscriptionService
+
+        triggered_alerts = []
+        user_key = str(user_id)
+
+        # Check each threshold
+        thresholds = [
+            (
+                settings.WARNING_THRESHOLD * 100,
+                "WARNING",
+                "Energy package at 20% remaining",
+            ),
+            (
+                settings.CRITICAL_THRESHOLD * 100,
+                "CRITICAL",
+                "Energy package at 10% remaining - Save Mode activated",
+            ),
+            (
+                settings.FINAL_THRESHOLD * 100,
+                "FINAL",
+                "Energy package at 5% remaining - Immediate action required",
+            ),
+        ]
+
+        for threshold, alert_type, message in thresholds:
+            if (
+                percentage <= threshold
+                and user_key
+                not in AlertService._triggered_thresholds.get(alert_type, set())
+            ):
+
+                await AlertService.create_alert(
+                    user_id, alert_type, percentage, message
+                )
+                triggered_alerts.append(alert_type)
+
+                # Mark this threshold as triggered for this user
+                if alert_type not in AlertService._triggered_thresholds:
+                    AlertService._triggered_thresholds[alert_type] = set()
+                AlertService._triggered_thresholds[alert_type].add(user_key)
+
+        return triggered_alerts
+
+    @staticmethod
+    async def get_user_alerts(
+        user_id: PyObjectId, read: Optional[bool] = None, limit: int = 50
+    ) -> List[Alert]:
+        """Get user alerts with optional filters"""
+        alerts_collection = get_collection("alerts")
+        query = {"user_id": user_id}
+        if read is not None:
+            query["read"] = read
+
+        cursor = alerts_collection.find(query).sort("timestamp", -1).limit(limit)
+        alerts = []
+        async for doc in cursor:
+            alerts.append(Alert(**doc))
+        return alerts
+
+    @staticmethod
+    async def mark_alert_as_read(alert_id: PyObjectId, user_id: PyObjectId) -> bool:
+        """Mark an alert as read"""
+        alerts_collection = get_collection("alerts")
+        result = await alerts_collection.update_one(
+            {"_id": alert_id, "user_id": user_id}, {"$set": {"read": True}}
+        )
+        return result.modified_count > 0
+
+    @staticmethod
+    async def mark_all_alerts_as_read(user_id: PyObjectId) -> bool:
+        """Mark all user alerts as read"""
+        alerts_collection = get_collection("alerts")
+        result = await alerts_collection.update_many(
+            {"user_id": user_id, "read": False}, {"$set": {"read": True}}
+        )
+        return result.modified_count > 0
+
+    @staticmethod
+    async def get_unread_count(user_id: PyObjectId) -> int:
+        """Get count of unread alerts"""
+        alerts_collection = get_collection("alerts")
+        return await alerts_collection.count_documents(
+            {"user_id": user_id, "read": False}
+        )
+
+
+
+==================== app/services/subscription_service.py ====================
+from typing import Optional, List
+from datetime import datetime, timedelta
+from app.database import get_collection
+from app.models import Subscription, PyObjectId, Plan, PlanResponse
+from app.utils import calculate_percentage_remaining, log_energy_event
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class SubscriptionService:
+    @staticmethod
+    def get_available_plans() -> List[PlanResponse]:
+        """Get available subscription plans"""
+        return [
+            PlanResponse(
+                id="basic",
+                name="Basic Plan",
+                total_kwh=50,
+                price=10.0,
+                duration_days=30,
+                features=["Basic consumption reports", "Daily consumption monitoring"],
+            ),
+            PlanResponse(
+                id="standard",
+                name="Standard Plan",
+                total_kwh=100,
+                price=18.0,
+                duration_days=30,
+                features=[
+                    "Basic consumption reports",
+                    "Daily consumption monitoring",
+                    "Consumption alerts",
+                    "Auto save mode",
+                ],
+            ),
+            PlanResponse(
+                id="premium",
+                name="Premium Plan",
+                total_kwh=200,
+                price=30.0,
+                duration_days=30,
+                features=[
+                    "Basic consumption reports",
+                    "Daily consumption monitoring",
+                    "Consumption alerts",
+                    "Auto save mode",
+                    "AI predictions",
+                    "Premium support",
+                ],
+            ),
+        ]
+
+    @staticmethod
+    async def create_subscription_from_plan(user_id: PyObjectId, plan_id: str) -> bool:
+        """Create a new subscription from a plan"""
+        available_plans = SubscriptionService.get_available_plans()
+        selected_plan = next(
+            (plan for plan in available_plans if plan.id == plan_id), None
+        )
+
+        if not selected_plan:
+            return False
+
+        subscriptions_collection = get_collection("subscriptions")
+
+        # حساب تاريخ الانتهاء بناءً على مدة الباقة
+        start_date = datetime.utcnow()
+        end_date = start_date + timedelta(days=selected_plan.duration_days)
+
+        subscription = Subscription(
+            user_id=user_id,
+            plan_id=selected_plan.id,
+            plan_name=selected_plan.name,
+            total_kwh=selected_plan.total_kwh,
+            remaining_kwh=selected_plan.total_kwh,
+            price=selected_plan.price,
+            start_date=start_date,
+            end_date=end_date,
+            status="active",
+        )
+
+        result = await subscriptions_collection.insert_one(
+            subscription.dict(by_alias=True)
+        )
+        return result.acknowledged
+
+    @staticmethod
+    async def upgrade_plan(user_id: PyObjectId, new_plan_id: str) -> bool:
+        """Upgrade user's subscription to a new plan"""
+        available_plans = SubscriptionService.get_available_plans()
+        new_plan = next(
+            (plan for plan in available_plans if plan.id == new_plan_id), None
+        )
+
+        if not new_plan:
+            return False
+
+        subscriptions_collection = get_collection("subscriptions")
+
+        # إلغاء تفعيل الباقة الحالية
+        await subscriptions_collection.update_many(
+            {"user_id": user_id, "status": "active"}, {"$set": {"status": "expired"}}
+        )
+
+        # إنشاء باقة جديدة
+        start_date = datetime.utcnow()
+        end_date = start_date + timedelta(days=new_plan.duration_days)
+
+        new_subscription = Subscription(
+            user_id=user_id,
+            plan_id=new_plan.id,
+            plan_name=new_plan.name,
+            total_kwh=new_plan.total_kwh,
+            remaining_kwh=new_plan.total_kwh,
+            price=new_plan.price,
+            start_date=start_date,
+            end_date=end_date,
+            status="active",
+        )
+
+        result = await subscriptions_collection.insert_one(
+            new_subscription.dict(by_alias=True)
+        )
+
+        if result.acknowledged:
+            log_energy_event(
+                str(user_id),
+                "PLAN_UPGRADED",
+                f"Upgraded to {new_plan.name} with {new_plan.total_kwh}kWh",
+            )
+            return True
+        return False
+
+    # ⬅️ الطرق الحالية تبقى كما هي مع تعديلات بسيطة
+    @staticmethod
+    async def get_active_subscription(user_id: PyObjectId) -> Optional[Subscription]:
+        """Get user's active subscription"""
+        subscriptions_collection = get_collection("subscriptions")
+        subscription_data = await subscriptions_collection.find_one(
+            {
+                "user_id": user_id,
+                "status": "active",
+                "end_date": {"$gte": datetime.utcnow()},
+            }
+        )
+
+        if subscription_data:
+            return Subscription(**subscription_data)
+        return None
+
+    @staticmethod
+    async def deduct_energy(user_id: PyObjectId, kwh_used: float) -> bool:
+        """Deduct energy consumption from subscription"""
+        subscription = await SubscriptionService.get_active_subscription(user_id)
+        if not subscription:
+            logger.warning(f"No active subscription found for user {user_id}")
+            return False
+
+        if subscription.remaining_kwh < kwh_used:
+            logger.warning(f"Insufficient energy for user {user_id}")
+            return False
+
+        subscriptions_collection = get_collection("subscriptions")
+        result = await subscriptions_collection.update_one(
+            {"_id": subscription.id}, {"$inc": {"remaining_kwh": -kwh_used}}
+        )
+
+        if result.modified_count > 0:
+            new_remaining = subscription.remaining_kwh - kwh_used
+            percentage = calculate_percentage_remaining(
+                new_remaining, subscription.total_kwh
+            )
+
+            log_energy_event(
+                str(user_id),
+                "ENERGY_DEDUCTED",
+                f"Deducted {kwh_used}kWh, remaining: {new_remaining}kWh ({percentage:.1f}%)",
+            )
+
+            return True
+
+        return False
+
+    @staticmethod
+    async def get_subscription_percentage(user_id: PyObjectId) -> Optional[float]:
+        """Get percentage of remaining energy"""
+        subscription = await SubscriptionService.get_active_subscription(user_id)
+        if not subscription:
+            return None
+
+        return calculate_percentage_remaining(
+            subscription.remaining_kwh, subscription.total_kwh
+        )
+
+    @staticmethod
+    async def get_user_subscriptions(user_id: PyObjectId) -> List[Subscription]:
+        """Get all user subscriptions"""
+        subscriptions_collection = get_collection("subscriptions")
+        cursor = subscriptions_collection.find({"user_id": user_id}).sort(
+            "start_date", -1
+        )
+        subscriptions = []
+        async for doc in cursor:
+            subscriptions.append(Subscription(**doc))
+        return subscriptions
+
+    @staticmethod
+    async def create_subscription(subscription: Subscription) -> bool:
+        """Create a new subscription (للتوافق مع الكود القديم)"""
+        subscriptions_collection = get_collection("subscriptions")
+        result = await subscriptions_collection.insert_one(
+            subscription.dict(by_alias=True)
+        )
+        return result.acknowledged
+
+
+
+==================== app/services/save_mode_service.py ====================
+from typing import Optional, Dict, Any
+from datetime import datetime
+from app.database import get_collection
+from app.models import User, PyObjectId, SaveModeCommand
+from app.utils import log_energy_event
+import logging
+from typing import List
+
+
+logger = logging.getLogger(__name__)
+
+class SaveModeService:
+    @staticmethod
+    async def enable_save_mode(user_id: PyObjectId, reason: str) -> bool:
+        """Enable save mode for user"""
+        users_collection = get_collection("users")
+        result = await users_collection.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "save_mode": True,
+                "save_mode_reason": reason,
+                "save_mode_activated_at": datetime.utcnow()
+            }}
+        )
+        
+        if result.modified_count > 0:
+            log_energy_event(str(user_id), "SAVE_MODE_ENABLED", f"Reason: {reason}")
+            logger.info(f"Save mode enabled for user {user_id}, reason: {reason}")
+            return True
+        return False
+
+    @staticmethod
+    async def disable_save_mode(user_id: PyObjectId) -> bool:
+        """Disable save mode for user"""
+        users_collection = get_collection("users")
+        result = await users_collection.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "save_mode": False,
+                "save_mode_reason": None
+            }}
+        )
+        
+        if result.modified_count > 0:
+            log_energy_event(str(user_id), "SAVE_MODE_DISABLED", "Manual disable")
+            logger.info(f"Save mode disabled for user {user_id}")
+            return True
+        return False
+
+    @staticmethod
+    async def get_save_mode_status(user_id: PyObjectId) -> Dict[str, Any]:
+        """Get save mode status and commands"""
+        users_collection = get_collection("users")
+        user_data = await users_collection.find_one({"_id": user_id})
+        
+        if not user_data:
+            return {"save_mode": False, "command": None}
+        
+        user = User(**user_data)
+        
+        if user.save_mode:
+            command = SaveModeCommand(
+                devices_to_turn_off=SaveModeService._get_devices_to_turn_off(user)
+            )
+            return {
+                "save_mode": True,
+                "reason": user.save_mode_reason,
+                "command": command.dict()
+            }
+        else:
+            return {"save_mode": False, "command": None}
+
+    @staticmethod
+    def _get_devices_to_turn_off(user: User) -> List[str]:
+        """Determine which devices to turn off based on user preferences"""
+        base_devices = ["AC", "Heater", "WaterBoiler"]
+        
+        # Adjust based on user preferences
+        if user.preferred_temp > 22:
+            # If user prefers warmer temps, don't turn off heater
+            base_devices = [device for device in base_devices if device != "Heater"]
+        else:
+            # If user prefers cooler temps, don't turn off AC
+            base_devices = [device for device in base_devices if device != "AC"]
+            
+        return base_devices
+
+    @staticmethod
+    async def process_low_energy_save_mode(user_id: PyObjectId, percentage: float) -> bool:
+        """Automatically enable save mode for low energy"""
+        from app.config import settings
+        
+        if percentage <= settings.CRITICAL_THRESHOLD * 100:
+            return await SaveModeService.enable_save_mode(
+                user_id, 
+                "auto_low_package"
+            )
+        return False
+
+
+==================== app/utils.py ====================
+from datetime import datetime, timedelta
+from typing import Optional, Any, Dict
+from jose import JWTError, jwt
+import bcrypt
+from app.config import settings
+import logging
+
+# Logger setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        # Ensure password is encoded to bytes and check against hash
+        return bcrypt.checkpw(
+            plain_password.encode('utf-8'), 
+            hashed_password.encode('utf-8')
+        )
+    except Exception as e:
+        logger.error(f"Password verification error: {str(e)}")
+        return False
+
+def get_password_hash(password: str) -> str:
+    try:
+        # Encode password to bytes, hash it, and return as string
+        password_bytes = password.encode('utf-8')
+        
+        # Truncate if longer than 72 bytes for bcrypt
+        if len(password_bytes) > 72:
+            password_bytes = password_bytes[:72]
+            logger.warning("Password truncated to 72 bytes for bcrypt")
+            
+        hashed = bcrypt.hashpw(password_bytes, bcrypt.gensalt())
+        return hashed.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Password hashing error: {str(e)}")
+        raise
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str) -> Optional[Dict[str, Any]]:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+def watt_to_kwh(watt: float, hours: float = 1.0) -> float:
+    """Convert watts to kWh"""
+    return (watt * hours) / 1000
+
+def calculate_percentage_remaining(remaining: float, total: float) -> float:
+    """Calculate percentage remaining"""
+    if total <= 0:
+        return 0
+    return (remaining / total) * 100
+
+def format_timestamp_for_ai(timestamp: datetime) -> str:
+    """Format timestamp for AI service"""
+    return timestamp.isoformat()
+
+def log_energy_event(user_id: str, event_type: str, details: str):
+    """Log energy-related events"""
+    logger.info(f"Energy Event - User: {user_id}, Type: {event_type}, Details: {details}")
+
+
